@@ -37,6 +37,7 @@ mnemos uses <a href="https://tidbcloud.com"><img src="assets/tidb-logo.png" alt=
 |---|---|
 | **Free tier** | 25 GiB storage, 250M Request Units/month — enough for most individual and small team use |
 | **Native VECTOR type** | Hybrid search (vector + keyword) without a separate vector database |
+| **Auto-embedding (`EMBED_TEXT`)** | TiDB generates embeddings server-side — no OpenAI key needed for semantic search |
 | **HTTP Data API** | Plugins talk to TiDB via `fetch`/`curl` — no database drivers, no connection pools |
 | **Zero ops** | No servers to manage, no scaling to worry about, automatic backups |
 | **MySQL compatible** | Migrate to self-hosted TiDB or MySQL anytime |
@@ -201,6 +202,17 @@ export MNEMO_EMBED_API_KEY="sk-..."
 export MNEMO_EMBED_BASE_URL="http://localhost:11434/v1"
 export MNEMO_EMBED_MODEL="nomic-embed-text"
 export MNEMO_EMBED_DIMS="768"
+```
+
+**Or use TiDB auto-embedding — no external API needed:**
+
+TiDB Cloud Serverless can generate embeddings server-side via `EMBED_TEXT()`. Set `autoEmbedModel` in your plugin config and TiDB handles the rest — no OpenAI key, no Ollama, no extra cost:
+
+```json
+{
+  "autoEmbedModel": "tidbcloud_free/amazon/titan-embed-text-v2",
+  "autoEmbedDims": 1024
+}
 ```
 
 ## Multi-Agent Conflict Resolution (CRDT)
