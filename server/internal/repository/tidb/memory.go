@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -14,13 +15,66 @@ import (
 )
 
 type MemoryRepo struct {
-	db        *sql.DB
-	autoModel string // non-empty = TiDB auto-embedding enabled
+	db           *sql.DB
+	autoModel    string
+	ftsAvailable bool
 }
 
 func NewMemoryRepo(db *sql.DB, autoModel string) *MemoryRepo {
-	return &MemoryRepo{db: db, autoModel: autoModel}
+	r := &MemoryRepo{db: db, autoModel: autoModel}
+	ensureFTSIndex(db)
+	r.ftsAvailable = probeFTS(db)
+	return r
 }
+
+// ensureFTSIndex attempts to create the FTS index if it does not yet exist.
+// Errors are ignored — the index may already exist or the cluster may not support it.
+func ensureFTSIndex(db *sql.DB) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, _ = db.ExecContext(ctx,
+		`ALTER TABLE memories ADD FULLTEXT INDEX idx_fts_content (content) WITH PARSER MULTILINGUAL ADD_COLUMNAR_REPLICA_ON_DEMAND`,
+	)
+}
+
+func probeFTS(db *sql.DB) bool {
+	const maxAttempts = 5
+	const retryDelay = 5 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err := db.ExecContext(ctx, `SELECT fts_match_word('probe', content) FROM memories LIMIT 0`)
+		cancel()
+		if err == nil {
+			return true
+		}
+		msg := err.Error()
+		isProvisioning := strings.Contains(strings.ToLower(msg), "columnar") ||
+			strings.Contains(strings.ToLower(msg), "tiflash")
+		isUnsupported := strings.Contains(msg, "1305") ||
+			strings.Contains(strings.ToLower(msg), "function") ||
+			strings.Contains(strings.ToLower(msg), "unknown")
+		if isProvisioning {
+			slog.Warn("FTS index provisioning in progress; will retry",
+				"attempt", attempt, "max", maxAttempts, "err", err)
+			if attempt < maxAttempts {
+				time.Sleep(retryDelay)
+				continue
+			}
+			slog.Warn("FTS not available after retries; keyword searches will fall back to LIKE")
+			return false
+		}
+		if isUnsupported {
+			slog.Warn("FTS not supported on this cluster; keyword searches will fall back to LIKE", "err", err)
+			return false
+		}
+		slog.Warn("FTS probe failed; keyword searches will fall back to LIKE", "err", err)
+		return false
+	}
+	return false
+}
+
+func (r *MemoryRepo) FTSAvailable() bool { return r.ftsAvailable }
 
 const allColumns = `id, space_id, content, key_name, source, tags, metadata, embedding, version, updated_by, created_at, updated_at, vector_clock, origin_agent, tombstone`
 
@@ -638,7 +692,40 @@ func (r *MemoryRepo) KeywordSearch(ctx context.Context, spaceID string, query st
 	return memories, rows.Err()
 }
 
-// buildWhere constructs a WHERE clause from the filter (used by List).
+// FTSSearch performs full-text search using FTS_MATCH_WORD with BM25 ranking.
+// Server-mode contract: includes tombstone = 0.
+func (r *MemoryRepo) FTSSearch(ctx context.Context, spaceID string, query string, f domain.MemoryFilter, limit int) ([]domain.Memory, error) {
+	conds, args := buildFilterConds(spaceID, f)
+	where := strings.Join(conds, " AND ")
+
+	sqlQuery := `SELECT ` + allColumns + `, fts_match_word(?, content) AS fts_score
+		 FROM memories
+		 WHERE ` + where + ` AND fts_match_word(?, content)
+		 ORDER BY fts_match_word(?, content) DESC
+		 LIMIT ?`
+
+	fullArgs := make([]any, 0, len(args)+4)
+	fullArgs = append(fullArgs, query)
+	fullArgs = append(fullArgs, args...)
+	fullArgs = append(fullArgs, query, query, limit)
+
+	rows, err := r.db.QueryContext(ctx, sqlQuery, fullArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("fts search: %w", err)
+	}
+	defer rows.Close()
+
+	var memories []domain.Memory
+	for rows.Next() {
+		m, err := scanMemoryRowsWithFTSScore(rows)
+		if err != nil {
+			return nil, err
+		}
+		memories = append(memories, *m)
+	}
+	return memories, rows.Err()
+}
+
 func buildWhere(spaceID string, f domain.MemoryFilter) (string, []any) {
 	conds, args := buildFilterConds(spaceID, f)
 	if f.Query != "" {
@@ -745,8 +832,31 @@ func scanMemoryRowsWithDistance(rows *sql.Rows) (*domain.Memory, error) {
 	return &m, nil
 }
 
-// marshalTags encodes tags to JSON. Empty/nil tags are stored as JSON `[]` (not NULL)
-// for consistent JSON_CONTAINS behavior.
+// scanMemoryRowsWithFTSScore scans a row that includes a trailing fts_score column (used by FTSSearch).
+func scanMemoryRowsWithFTSScore(rows *sql.Rows) (*domain.Memory, error) {
+	var m domain.Memory
+	var keyName, source, updatedBy, originAgent sql.NullString
+	var tagsJSON, metadataJSON, embeddingStr, clockJSON []byte
+	var ftsScore float64
+
+	err := rows.Scan(&m.ID, &m.SpaceID, &m.Content, &keyName, &source,
+		&tagsJSON, &metadataJSON, &embeddingStr, &m.Version, &updatedBy, &m.CreatedAt, &m.UpdatedAt,
+		&clockJSON, &originAgent, &m.Tombstone,
+		&ftsScore)
+	if err != nil {
+		return nil, fmt.Errorf("scan memory row with fts score: %w", err)
+	}
+	m.KeyName = keyName.String
+	m.Source = source.String
+	m.UpdatedBy = updatedBy.String
+	m.OriginAgent = originAgent.String
+	m.Tags = unmarshalTags(tagsJSON)
+	m.Metadata = unmarshalRawJSON(metadataJSON)
+	m.VectorClock = unmarshalClock(clockJSON)
+	m.Score = &ftsScore
+	return &m, nil
+}
+
 func marshalTags(tags []string) []byte {
 	if len(tags) == 0 {
 		return []byte("[]")

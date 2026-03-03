@@ -23,13 +23,14 @@ const (
 )
 
 type MemoryService struct {
-	memories  repository.MemoryRepo
-	embedder  *embed.Embedder // nil = no client-side embedding
-	autoModel string          // non-empty = TiDB auto-embedding
+	memories     repository.MemoryRepo
+	embedder     *embed.Embedder
+	autoModel    string
+	ftsAvailable bool
 }
 
-func NewMemoryService(memories repository.MemoryRepo, embedder *embed.Embedder, autoModel string) *MemoryService {
-	return &MemoryService{memories: memories, embedder: embedder, autoModel: autoModel}
+func NewMemoryService(memories repository.MemoryRepo, embedder *embed.Embedder, autoModel string, ftsAvailable bool) *MemoryService {
+	return &MemoryService{memories: memories, embedder: embedder, autoModel: autoModel, ftsAvailable: ftsAvailable}
 }
 
 func (s *MemoryService) Create(ctx context.Context, spaceID, agentName, content, keyName string, tags []string, metadata json.RawMessage, clock map[string]uint64, writeID string) (*domain.WriteResult, error) {
@@ -172,19 +173,68 @@ func (s *MemoryService) Get(ctx context.Context, spaceID, id string) (*domain.Me
 	return s.memories.GetByID(ctx, spaceID, id)
 }
 
-// Search returns filtered and paginated memories.
-// If an embedder is configured and a query is provided, performs hybrid search.
 func (s *MemoryService) Search(ctx context.Context, spaceID string, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
-	if filter.Query != "" && s.autoModel != "" {
+	if filter.Query == "" {
+		return s.memories.List(ctx, spaceID, filter)
+	}
+	if s.autoModel != "" {
 		return s.autoHybridSearch(ctx, spaceID, filter)
 	}
-	if s.embedder != nil && filter.Query != "" {
+	if s.embedder != nil {
 		return s.hybridSearch(ctx, spaceID, filter)
+	}
+	if s.ftsAvailable {
+		return s.ftsOnlySearch(ctx, spaceID, filter)
 	}
 	return s.memories.List(ctx, spaceID, filter)
 }
 
-// hybridSearch performs vector + keyword search, merges and ranks results.
+const rrfK = 60.0
+
+func rrfMerge(ftsResults, vecResults []domain.Memory) map[string]float64 {
+	scores := make(map[string]float64, len(ftsResults)+len(vecResults))
+	for rank, m := range ftsResults {
+		scores[m.ID] += 1.0 / (rrfK + float64(rank+1))
+	}
+	for rank, m := range vecResults {
+		scores[m.ID] += 1.0 / (rrfK + float64(rank+1))
+	}
+	return scores
+}
+
+func (s *MemoryService) paginate(results []domain.Memory, offset, limit int) ([]domain.Memory, int) {
+	total := len(results)
+	if offset >= total {
+		return []domain.Memory{}, total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return results[offset:end], total
+}
+
+func (s *MemoryService) ftsOnlySearch(ctx context.Context, spaceID string, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	fetchLimit := limit * 3
+
+	ftsResults, err := s.memories.FTSSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
+	if err != nil {
+		slog.Warn("FTS search failed, falling back to list", "err", err)
+		return s.memories.List(ctx, spaceID, filter)
+	}
+
+	page, total := s.paginate(ftsResults, offset, limit)
+	return page, total, nil
+}
+
 func (s *MemoryService) hybridSearch(ctx context.Context, spaceID string, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > 200 {
@@ -196,75 +246,48 @@ func (s *MemoryService) hybridSearch(ctx context.Context, spaceID string, filter
 	}
 	fetchLimit := limit * 3
 
-	// Embed the query.
 	queryVec, err := s.embedder.Embed(ctx, filter.Query)
 	if err != nil {
-		// Fall back to keyword-only if embedding fails.
 		slog.Warn("embedding failed, falling back to keyword search", "err", err)
+		if s.ftsAvailable {
+			return s.ftsOnlySearch(ctx, spaceID, filter)
+		}
 		return s.memories.List(ctx, spaceID, filter)
 	}
 
-	// Vector search (ANN).
-	vecResults, err := s.memories.VectorSearch(ctx, spaceID, queryVec, filter, fetchLimit)
-	if err != nil {
-		slog.Warn("vector search failed, falling back to keyword search", "err", err)
-		return s.memories.List(ctx, spaceID, filter)
+	vecResults, vecErr := s.memories.VectorSearch(ctx, spaceID, queryVec, filter, fetchLimit)
+	if vecErr != nil {
+		slog.Warn("vector leg skipped", "err", vecErr)
+		vecResults = nil
 	}
 
-	// Keyword search.
-	kwResults, err := s.memories.KeywordSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	// Merge by ID — vector score takes priority.
-	type scored struct {
-		mem   domain.Memory
-		score float64
-	}
-	byID := make(map[string]*scored, len(vecResults)+len(kwResults))
-
-	for _, m := range vecResults {
-		s := 0.0
-		if m.Score != nil {
-			s = *m.Score
+	var kwResults []domain.Memory
+	var kwErr error
+	if s.ftsAvailable {
+		kwResults, kwErr = s.memories.FTSSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
+		if kwErr != nil {
+			slog.Warn("keyword leg skipped", "err", kwErr)
+			kwResults = nil
 		}
-		byID[m.ID] = &scored{mem: m, score: s}
-	}
-	for _, m := range kwResults {
-		if _, exists := byID[m.ID]; !exists {
-			neutralScore := 0.5
-			m.Score = &neutralScore
-			byID[m.ID] = &scored{mem: m, score: neutralScore}
+	} else {
+		kwResults, kwErr = s.memories.KeywordSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
+		if kwErr != nil {
+			slog.Warn("keyword leg skipped", "err", kwErr)
+			kwResults = nil
 		}
 	}
 
-	// Sort by score descending.
-	merged := make([]scored, 0, len(byID))
-	for _, s := range byID {
-		merged = append(merged, *s)
+	if vecErr != nil && kwErr != nil {
+		slog.Error("both search legs failed")
+		return []domain.Memory{}, 0, nil
 	}
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].score > merged[j].score
-	})
 
-	total := len(merged)
+	scores := rrfMerge(kwResults, vecResults)
+	mems := collectMems(kwResults, vecResults)
+	merged := sortByScore(mems, scores)
 
-	// Paginate after merge.
-	if offset >= len(merged) {
-		return []domain.Memory{}, total, nil
-	}
-	end := offset + limit
-	if end > len(merged) {
-		end = len(merged)
-	}
-	page := merged[offset:end]
-
-	result := make([]domain.Memory, len(page))
-	for i, s := range page {
-		result[i] = s.mem
-	}
-	return result, total, nil
+	page, total := s.paginate(merged, offset, limit)
+	return setScores(page, scores), total, nil
 }
 
 func (s *MemoryService) autoHybridSearch(ctx context.Context, spaceID string, filter domain.MemoryFilter) ([]domain.Memory, int, error) {
@@ -278,62 +301,71 @@ func (s *MemoryService) autoHybridSearch(ctx context.Context, spaceID string, fi
 	}
 	fetchLimit := limit * 3
 
-	vecResults, err := s.memories.AutoVectorSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
-	if err != nil {
-		slog.Warn("auto vector search failed, falling back to keyword search", "err", err)
-		return s.memories.List(ctx, spaceID, filter)
+	vecResults, vecErr := s.memories.AutoVectorSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
+	if vecErr != nil {
+		slog.Warn("vector leg skipped", "err", vecErr)
+		vecResults = nil
 	}
 
-	kwResults, err := s.memories.KeywordSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	type scored struct {
-		mem   domain.Memory
-		score float64
-	}
-	byID := make(map[string]*scored, len(vecResults)+len(kwResults))
-
-	for _, m := range vecResults {
-		sc := 0.0
-		if m.Score != nil {
-			sc = *m.Score
+	var kwResults []domain.Memory
+	var kwErr error
+	if s.ftsAvailable {
+		kwResults, kwErr = s.memories.FTSSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
+		if kwErr != nil {
+			slog.Warn("keyword leg skipped", "err", kwErr)
+			kwResults = nil
 		}
-		byID[m.ID] = &scored{mem: m, score: sc}
+	} else {
+		kwResults, kwErr = s.memories.KeywordSearch(ctx, spaceID, filter.Query, filter, fetchLimit)
+		if kwErr != nil {
+			slog.Warn("keyword leg skipped", "err", kwErr)
+			kwResults = nil
+		}
 	}
+
+	if vecErr != nil && kwErr != nil {
+		slog.Error("both search legs failed")
+		return []domain.Memory{}, 0, nil
+	}
+
+	scores := rrfMerge(kwResults, vecResults)
+	mems := collectMems(kwResults, vecResults)
+	merged := sortByScore(mems, scores)
+
+	page, total := s.paginate(merged, offset, limit)
+	return setScores(page, scores), total, nil
+}
+
+func collectMems(kwResults, vecResults []domain.Memory) map[string]domain.Memory {
+	mems := make(map[string]domain.Memory, len(kwResults)+len(vecResults))
 	for _, m := range kwResults {
-		if _, exists := byID[m.ID]; !exists {
-			neutralScore := 0.5
-			m.Score = &neutralScore
-			byID[m.ID] = &scored{mem: m, score: neutralScore}
+		mems[m.ID] = m
+	}
+	for _, m := range vecResults {
+		if _, seen := mems[m.ID]; !seen {
+			mems[m.ID] = m
 		}
 	}
+	return mems
+}
 
-	merged := make([]scored, 0, len(byID))
-	for _, sc := range byID {
-		merged = append(merged, *sc)
+func sortByScore(mems map[string]domain.Memory, scores map[string]float64) []domain.Memory {
+	result := make([]domain.Memory, 0, len(mems))
+	for id := range mems {
+		result = append(result, mems[id])
 	}
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].score > merged[j].score
+	sort.Slice(result, func(i, j int) bool {
+		return scores[result[i].ID] > scores[result[j].ID]
 	})
+	return result
+}
 
-	total := len(merged)
-
-	if offset >= len(merged) {
-		return []domain.Memory{}, total, nil
+func setScores(page []domain.Memory, scores map[string]float64) []domain.Memory {
+	for i := range page {
+		sc := scores[page[i].ID]
+		page[i].Score = &sc
 	}
-	end := offset + limit
-	if end > len(merged) {
-		end = len(merged)
-	}
-	page := merged[offset:end]
-
-	result := make([]domain.Memory, len(page))
-	for i, sc := range page {
-		result[i] = sc.mem
-	}
-	return result, total, nil
+	return page
 }
 
 // Update modifies an existing memory with LWW conflict resolution.

@@ -27,6 +27,10 @@ type MemoryRepo interface {
 
 	KeywordSearch(ctx context.Context, spaceID string, query string, f domain.MemoryFilter, limit int) ([]domain.Memory, error)
 
+	// FTSSearch performs full-text search using FTS_MATCH_WORD with BM25 ranking.
+	// Results include a fts_score field used for RRF merge.
+	FTSSearch(ctx context.Context, spaceID string, query string, f domain.MemoryFilter, limit int) ([]domain.Memory, error)
+
 	// CRDTUpsert performs a transactional upsert with vector clock semantics.
 	// The decide callback receives the existing row (nil if not found) and returns
 	// the memory to write and whether the incoming write was dominated (no-op).

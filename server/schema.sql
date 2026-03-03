@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS memories (
   INDEX idx_tombstone     (space_id, tombstone)
 );
 
+-- Full-text search index (TiDB Cloud Serverless with MULTILINGUAL tokenizer).
+-- ADD_COLUMNAR_REPLICA_ON_DEMAND auto-provisions TiFlash on Serverless clusters.
+-- Run after the memories table is created. Safe to re-run (fails silently if index exists).
+-- ALTER TABLE memories
+--   ADD FULLTEXT INDEX idx_fts_content (content)
+--   WITH PARSER MULTILINGUAL
+--   ADD_COLUMNAR_REPLICA_ON_DEMAND;
+
 -- Vector index requires TiFlash. May fail on plain MySQL; safe to ignore.
 -- ALTER TABLE memories ADD VECTOR INDEX idx_cosine ((VEC_COSINE_DISTANCE(embedding)));
 

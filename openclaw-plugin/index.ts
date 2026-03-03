@@ -99,7 +99,8 @@ function createDirectBackend(
       cfg.password,
       cfg.database ?? "mnemos",
       null,
-      cfg.autoEmbedModel
+      cfg.autoEmbedModel,
+      cfg.autoEmbedDims
     );
   }
   const embedder = createEmbedder(cfg.embedding);

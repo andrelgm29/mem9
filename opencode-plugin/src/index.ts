@@ -32,13 +32,12 @@ const mnemoPlugin: Plugin = async (_input) => {
       );
       return {};
     }
-    console.info("[mnemo] Direct mode (TiDB Serverless HTTP Data API)");
-    backend = new DirectBackend(cfg);
-    if (cfg.embedApiKey) {
-      console.warn(
-        "[mnemo] Direct mode does not support vector/hybrid search yet. MNEMO_EMBED_API_KEY is set but will be ignored. Keyword search will be used."
-      );
+    if (cfg.autoEmbedModel) {
+      console.info(`[mnemo] Direct mode (auto-embed hybrid: ${cfg.autoEmbedModel})`);
+    } else {
+      console.info("[mnemo] Direct mode (keyword search: FTS preferred, LIKE fallback)");
     }
+    backend = new DirectBackend(cfg);
   } else {
     if (!cfg.apiToken) {
       console.warn(

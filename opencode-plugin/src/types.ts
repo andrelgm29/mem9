@@ -17,6 +17,10 @@ export interface MnemoConfig {
   embedBaseUrl?: string;
   embedModel: string;
   embedDims: number;
+
+  // TiDB auto-embedding (direct mode only — no external API key required)
+  autoEmbedModel?: string;
+  autoEmbedDims: number;
 }
 
 export interface Memory {
@@ -86,5 +90,7 @@ export function loadConfig(): MnemoConfig {
     embedBaseUrl: process.env.MNEMO_EMBED_BASE_URL ?? undefined,
     embedModel: process.env.MNEMO_EMBED_MODEL ?? "text-embedding-3-small",
     embedDims: parseInt(process.env.MNEMO_EMBED_DIMS ?? "1536", 10) || 1536,
+    autoEmbedModel: process.env.MNEMO_AUTO_EMBED_MODEL || undefined,
+    autoEmbedDims: parseInt(process.env.MNEMO_AUTO_EMBED_DIMS ?? "1024", 10) || 1024,
   };
 }

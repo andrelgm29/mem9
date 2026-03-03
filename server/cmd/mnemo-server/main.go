@@ -50,11 +50,16 @@ func main() {
 
 	// Repositories.
 	memoryRepo := tidb.NewMemoryRepo(db, cfg.EmbedAutoModel)
+	if memoryRepo.FTSAvailable() {
+		logger.Info("FTS available (FTS_MATCH_WORD): keyword search will use FTS")
+	} else {
+		logger.Info("FTS unavailable: keyword search will use LIKE fallback")
+	}
 	tokenRepo := tidb.NewSpaceTokenRepo(db)
 	userTokenRepo := tidb.NewUserTokenRepo(db)
 
 	// Services.
-	memorySvc := service.NewMemoryService(memoryRepo, embedder, cfg.EmbedAutoModel)
+	memorySvc := service.NewMemoryService(memoryRepo, embedder, cfg.EmbedAutoModel, memoryRepo.FTSAvailable())
 	spaceSvc := service.NewSpaceService(tokenRepo, userTokenRepo, memoryRepo)
 
 	// Middleware.
