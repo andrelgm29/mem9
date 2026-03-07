@@ -378,27 +378,25 @@ Return ONLY valid JSON. No markdown fences, no explanation.
 	return facts, nil
 }
 
-// reconcile takes extracted facts and reconciles them against existing memories.
+// reconcile searches relevant memories for each fact, deduplicates, then sends
+// all facts and all retrieved memories to the LLM in a single call for batch
+// decision-making. This gives the LLM a complete view of both the new facts and
+// the existing knowledge base, enabling better ADD/UPDATE/DELETE/NOOP decisions.
 func (s *IngestService) reconcile(ctx context.Context, agentName, agentID, sessionID string, facts []string) ([]string, int, error) {
-	// Fetch existing active insights (scoped to this agent) + all pinned memories for context.
-	existingMemories, err := s.fetchExistingForReconcile(ctx, agentID, facts)
-	if err != nil {
-		slog.Warn("failed to fetch existing memories for reconciliation, proceeding with ADD-all", "err", err)
-		return s.addAllFacts(ctx, agentName, agentID, sessionID, facts)
-	}
+	// Step 1: For each fact, search for relevant existing memories and collect them.
+	existingMemories := s.gatherExistingMemories(ctx, agentID, facts)
 
 	if len(existingMemories) == 0 {
-		// No existing memories — add all facts directly.
 		return s.addAllFacts(ctx, agentName, agentID, sessionID, facts)
 	}
 
-	// Build context for the reconciliation prompt using integer IDs.
+	// Step 2: Map real UUIDs to integer IDs to prevent LLM hallucination.
 	type memoryRef struct {
 		IntID int    `json:"id"`
 		Text  string `json:"text"`
 	}
 	refs := make([]memoryRef, len(existingMemories))
-	idMap := make(map[int]string, len(existingMemories)) // intID -> real UUID
+	idMap := make(map[int]string, len(existingMemories))
 	for i, m := range existingMemories {
 		refs[i] = memoryRef{IntID: i, Text: m.Content}
 		idMap[i] = m.ID
@@ -407,41 +405,25 @@ func (s *IngestService) reconcile(ctx context.Context, agentName, agentID, sessi
 	refsJSON, _ := json.Marshal(refs)
 	factsJSON, _ := json.Marshal(facts)
 
-	systemPrompt := `You are a memory reconciliation engine. You manage a knowledge base by comparing 
-newly extracted facts against existing memories and deciding the correct action for each.
+	// Step 3: Single LLM call with all facts + all existing memories.
+	systemPrompt := `You are a memory management engine. You manage a knowledge base by comparing newly extracted facts against existing memories and deciding the correct action for each fact.
 
 ## Actions
 
-- **ADD**: The fact is genuinely new information not covered by any existing memory.
-- **UPDATE**: The fact refines, corrects, or supersedes an existing memory. Keep the same ID.
-  - Update when: new info is more specific, more recent, or contradicts the old memory.
-  - Do NOT update when: old and new convey the same meaning (even if worded differently).
+- **ADD**: The fact is new information not present in any existing memory.
+- **UPDATE**: The fact refines, corrects, or adds detail to an existing memory. Keep the same ID. If the existing memory and the new fact convey the same meaning, keep the one with more information. Do NOT update if they mean the same thing (e.g., "Likes pizza" vs "Loves pizza").
 - **DELETE**: The fact directly contradicts an existing memory, making it obsolete.
 - **NOOP**: The fact is already captured by an existing memory. No action needed.
 
 ## Rules
 
 1. Reference existing memories by their integer ID ONLY (0, 1, 2...). Never invent IDs.
-2. For UPDATE, always include the original text in "old_memory" for audit.
-3. For ADD, the "id" field is ignored by the system — use any value.
-4. When a new fact covers the same topic as an existing memory but adds detail or corrects it, prefer UPDATE.
-5. When a new fact is about a topic not covered by any existing memory, use ADD.
-6. When a new fact means the same thing as an existing memory (even if worded differently), use NOOP.
+2. For UPDATE, always include the original text in "old_memory".
+3. For ADD, the "id" field is ignored by the system — set it to "new" or omit it.
+4. When the fact adds detail or corrects an existing memory on the same topic, prefer UPDATE.
+5. When the fact covers a topic not in any existing memory, use ADD.
+6. When the fact means the same thing as an existing memory (even if worded differently), use NOOP.
 7. Preserve the language of the original facts. Do not translate.
-
-## Example
-
-Input memories:
-[{"id": 0, "text": "Uses PostgreSQL for the main database"}]
-
-New facts:
-["Recently migrated to TiDB from PostgreSQL", "Prefers dark mode in IDE"]
-
-Expected output:
-{"memory": [
-  {"id": "0", "text": "Uses TiDB for the main database (migrated from PostgreSQL)", "event": "UPDATE", "old_memory": "Uses PostgreSQL for the main database"},
-  {"id": "1", "text": "Prefers dark mode in IDE", "event": "ADD"}
-]}
 
 ## Output Format
 
@@ -452,7 +434,7 @@ Return ONLY valid JSON. No markdown fences.
     {"id": "0", "text": "...", "event": "NOOP"},
     {"id": "1", "text": "updated text", "event": "UPDATE", "old_memory": "original text"},
     {"id": "2", "text": "...", "event": "DELETE"},
-    {"id": "3", "text": "brand new fact", "event": "ADD"}
+    {"id": "new", "text": "brand new fact", "event": "ADD"}
   ]
 }`
 
@@ -464,7 +446,7 @@ New facts extracted from recent conversation:
 
 %s
 
-Reconcile the new facts with current memory. Return the full memory state after reconciliation.`, string(refsJSON), string(factsJSON))
+Analyze the new facts and determine whether each should be added, updated, or deleted in memory. Return the full memory state after reconciliation.`, string(refsJSON), string(factsJSON))
 
 	raw, err := s.llm.CompleteJSON(ctx, systemPrompt, userPrompt)
 	if err != nil {
@@ -498,7 +480,7 @@ Reconcile the new facts with current memory. Return the full memory state after 
 		}
 	}
 
-	// Execute reconciliation decisions.
+	// Step 4: Execute each action.
 	var resultIDs []string
 	var warnings int
 
@@ -517,11 +499,10 @@ Reconcile the new facts with current memory. Return the full memory state after 
 			resultIDs = append(resultIDs, newID)
 
 		case "UPDATE":
-			// Validate the ID references an existing memory.
 			intID := parseIntID(event.ID)
 			realID, ok := idMap[intID]
 			if !ok || event.Text == "" {
-				slog.Warn("skipping UPDATE with invalid ID", "id", event.ID)
+				slog.Warn("skipping UPDATE with invalid ID or empty text", "id", event.ID)
 				continue
 			}
 			// Guard: never auto-update pinned memories — treat as ADD instead.
@@ -559,13 +540,12 @@ Reconcile the new facts with current memory. Return the full memory state after 
 			}
 			if delErr := s.memories.SetState(ctx, realID, domain.StateDeleted); delErr != nil {
 				if !errors.Is(delErr, domain.ErrNotFound) {
-					// ErrNotFound = row already archived/moved by concurrent operation — safe to skip
 					slog.Warn("failed to delete memory", "err", delErr, "id", event.ID)
 					warnings++
 				}
 			}
 
-		case "NOOP":
+		case "NOOP", "NONE":
 			// No action needed.
 
 		default:
@@ -576,117 +556,102 @@ Reconcile the new facts with current memory. Return the full memory state after 
 	return resultIDs, warnings, nil
 }
 
-// fetchExistingForReconcile gets existing memories for reconciliation.
-// Insights are scoped to the requesting agent (so agent A never mutates agent B's insights).
-// Pinned memories are space-level and always included (but protected from mutation by guards in reconcile).
-func (s *IngestService) fetchExistingForReconcile(ctx context.Context, agentID string, facts []string) ([]domain.Memory, error) {
-	const reconcileMemoryCap = 30
-	const reconcileContentMaxLen = 150
+// gatherExistingMemories searches relevant memories for each fact, deduplicates
+// by ID, and returns a single flat list. Insights are scoped to the requesting
+// agent; pinned memories are space-level.
+//
+// Graceful degradation contract: on any search/list failure, the error is logged
+// and that source is skipped. A nil return means all sources failed or the store
+// is empty — the caller (reconcile) will fall through to addAllFacts, which may
+// create duplicates but never loses data.
+func (s *IngestService) gatherExistingMemories(ctx context.Context, agentID string, facts []string) []domain.Memory {
+	const perFactLimit = 5
+	const contentMaxLen = 150
+	const maxExistingMemories = 60 // Cap total results to prevent LLM token overflow
 
 	if s.embedder == nil && s.autoModel == "" {
-		// No vector search available — fall back to listing.
-		// Insights scoped to agent; pinned is space-level (no AgentID filter).
-		// Reserve dedicated slots for pinned so they're never starved by insights.
-		const pinnedReserve = 5
-		insightLimit := reconcileMemoryCap - pinnedReserve
-
-		pinnedMems, _, pinnedErr := s.memories.List(ctx, domain.MemoryFilter{
-			State:      "active",
-			MemoryType: "pinned",
-			Limit:      pinnedReserve,
-		})
-		insightMems, _, insightErr := s.memories.List(ctx, domain.MemoryFilter{
-			State:      "active",
-			MemoryType: "insight",
-			AgentID:    agentID,
-			Limit:      insightLimit,
-		})
-		if insightErr != nil && pinnedErr != nil {
-			return nil, fmt.Errorf("list insights: %w; list pinned: %w", insightErr, pinnedErr)
-		}
-		if insightErr != nil {
-			slog.Warn("failed to list insight memories for reconcile", "err", insightErr)
-		}
-		if pinnedErr != nil {
-			slog.Warn("failed to list pinned memories for reconcile", "err", pinnedErr)
-		}
-		// Merge: pinned first (guaranteed slots), then insights fill remainder.
+		// No vector search — fall back to listing recent memories.
+		var result []domain.Memory
 		seen := make(map[string]struct{})
-		var memories []domain.Memory
-		for _, list := range [][]domain.Memory{pinnedMems, insightMems} {
-			for _, m := range list {
+		for _, filter := range []domain.MemoryFilter{
+			{State: "active", MemoryType: "insight", AgentID: agentID, Limit: perFactLimit * len(facts)},
+			{State: "active", MemoryType: "pinned", Limit: perFactLimit},
+		} {
+			mems, _, err := s.memories.List(ctx, filter)
+			if err != nil {
+				slog.Warn("list memories for reconcile failed", "err", err, "type", filter.MemoryType)
+				continue
+			}
+			for _, m := range mems {
 				if _, ok := seen[m.ID]; ok {
 					continue
 				}
 				seen[m.ID] = struct{}{}
-				m.Content = truncateRunes(m.Content, reconcileContentMaxLen)
-				memories = append(memories, m)
-				if len(memories) >= reconcileMemoryCap {
-					return memories, nil
-				}
+				m.Content = truncateRunes(m.Content, contentMaxLen)
+				result = append(result, m)
 			}
 		}
-		return memories, nil
+		if len(result) > maxExistingMemories {
+			slog.Warn("gatherExistingMemories: truncating no-vector results", "count", len(result), "max", maxExistingMemories)
+			result = result[:maxExistingMemories]
+		}
+		return result
 	}
 
+	// Vector search: for each fact, search insights (agent-scoped) and pinned
+	// (space-level), then deduplicate across all results.
 	seen := make(map[string]struct{})
 	var result []domain.Memory
 
-	// Scope insights to this agent; pinned memories are always space-level.
-	insightFilter := domain.MemoryFilter{
-		State:      "active",
-		MemoryType: "insight",
-		AgentID:    agentID,
-	}
-	pinnedFilter := domain.MemoryFilter{
-		State:      "active",
-		MemoryType: "pinned",
-	}
+	insightFilter := domain.MemoryFilter{State: "active", MemoryType: "insight", AgentID: agentID}
+	pinnedFilter := domain.MemoryFilter{State: "active", MemoryType: "pinned"}
 
 	for _, fact := range facts {
-		// Pre-compute embedding once per fact (not per filter).
+		// Pre-compute embedding once per fact.
 		var vec []float32
 		if s.autoModel == "" {
-			var embedErr error
-			vec, embedErr = s.embedder.Embed(ctx, fact)
-			if embedErr != nil {
-				slog.Warn("embedding failed for fact during reconcile", "err", embedErr)
+			var err error
+			vec, err = s.embedder.Embed(ctx, fact)
+			if err != nil {
+				slog.Warn("embedding failed for fact during reconcile", "err", err)
 				continue
 			}
 		}
-		// Search agent-scoped insights and space-level pinned memories separately, then merge.
+
 		for _, filter := range []domain.MemoryFilter{insightFilter, pinnedFilter} {
 			var matches []domain.Memory
 			var err error
 
 			if s.autoModel != "" {
-				matches, err = s.memories.AutoVectorSearch(ctx, fact, filter, 10)
+				matches, err = s.memories.AutoVectorSearch(ctx, fact, filter, perFactLimit)
 			} else {
-				matches, err = s.memories.VectorSearch(ctx, vec, filter, 10)
+				matches, err = s.memories.VectorSearch(ctx, vec, filter, perFactLimit)
 			}
-
 			if err != nil {
-				slog.Warn("vector search failed for fact during reconcile", "err", err)
+				slog.Warn("vector search failed during reconcile", "err", err, "type", filter.MemoryType)
 				continue
 			}
 
 			for _, m := range matches {
-				if _, ok := seen[m.ID]; !ok {
-					seen[m.ID] = struct{}{}
-					m.Content = truncateRunes(m.Content, reconcileContentMaxLen)
-					result = append(result, m)
-					if len(result) >= reconcileMemoryCap {
-						return result, nil
-					}
+				if _, ok := seen[m.ID]; ok {
+					continue
 				}
+				seen[m.ID] = struct{}{}
+				m.Content = truncateRunes(m.Content, contentMaxLen)
+				result = append(result, m)
 			}
 		}
 	}
 
-	return result, nil
+	if len(result) > maxExistingMemories {
+		slog.Warn("gatherExistingMemories: truncating vector results", "count", len(result), "max", maxExistingMemories)
+		result = result[:maxExistingMemories]
+	}
+	return result
 }
 
-// addAllFacts adds all facts as new insights (fallback when reconciliation fails).
+// addAllFacts adds all facts as new insights (fallback when reconciliation is
+// not possible, e.g., no existing memories or LLM failure).
 func (s *IngestService) addAllFacts(ctx context.Context, agentName, agentID, sessionID string, facts []string) ([]string, int, error) {
 	var ids []string
 	var warnings int
