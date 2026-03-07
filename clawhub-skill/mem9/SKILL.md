@@ -108,6 +108,8 @@ openclaw plugins install @mem9/mem9
 
 ### Step 3 — Configure openclaw.json
 
+#### OpenClaw ≥2.2.0
+
 `[AGENT]` Patch existing config (merge-safe, preserves other keys):
 
 ```bash
@@ -116,9 +118,12 @@ jq --arg tid "$TENANT_ID" '
   .plugins.entries.mem9 = {
     enabled: true,
     config: { apiUrl: "https://api.mem9.ai", tenantID: $tid }
-  }
+  } |
+  .plugins.allow = ((.plugins.allow // []) + ["mem9"] | unique)
 ' openclaw.json > tmp.json && mv tmp.json openclaw.json
 ```
+
+**Note:** The `allow` array is additive—existing entries are preserved, `mem9` is appended (deduplicated).
 
 Or if no `openclaw.json` exists, create:
 
@@ -134,9 +139,24 @@ Or if no `openclaw.json` exists, create:
           "tenantID": "<your-tenant-id>"
         }
       }
-    }
+    },
+    "allow": ["mem9"]
   }
 }
+```
+
+#### OpenClaw <2.2.0
+
+`[AGENT]` No `allow` array needed:
+
+```bash
+jq --arg tid "$TENANT_ID" '
+  .plugins.slots.memory = "mem9" |
+  .plugins.entries.mem9 = {
+    enabled: true,
+    config: { apiUrl: "https://api.mem9.ai", tenantID: $tid }
+  }
+' openclaw.json > tmp.json && mv tmp.json openclaw.json
 ```
 
 If result returns stored memory → setup successful.
