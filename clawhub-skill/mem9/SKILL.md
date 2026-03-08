@@ -108,6 +108,8 @@ If the user asks "What is the relationship between tenantID and key?" answer pla
 `[AGENT]` Ask the user before doing anything else:
 
 > Do you already have a mem9 space ID from a previous install or another machine?
+>
+> After this question, the gateway will restart to apply the mem9 plugin. Please wait a few minutes and send a message to confirm the mem9 is working.
 
 **If yes** — ask the user to paste the ID, save it as `SPACE_ID`, then skip to Step 2.
 
