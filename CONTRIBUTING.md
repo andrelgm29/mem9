@@ -75,7 +75,7 @@ When adding a new feature, start from the domain types and work outward.
 
 ## Reporting Issues
 
-Please use [GitHub Issues](https://github.com/mem9-ai/mem/issues) with:
+Please use [GitHub Issues](https://github.com/mem9-ai/mem9/issues) with:
 - Steps to reproduce
 - Expected vs actual behavior
 - Server version and database type
