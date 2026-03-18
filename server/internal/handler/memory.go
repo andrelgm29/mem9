@@ -47,7 +47,7 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hasMessages {
-		messages := append([]service.IngestMessage(nil), req.Messages...)
+		messages := service.StripInjectedContext(append([]service.IngestMessage(nil), req.Messages...))
 		ingestReq := service.IngestRequest{
 			Messages:  messages,
 			SessionID: req.SessionID,
@@ -56,12 +56,46 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 		}
 
 		go func(agentName string, req service.IngestRequest) {
-			result, err := svc.ingest.Ingest(context.Background(), agentName, req)
+			// Step 1: store raw sessions immediately — preserved even if LLM fails.
+			if err := svc.session.BulkCreate(context.Background(), agentName, req); err != nil {
+				slog.Error("async session raw save failed",
+					"cluster_id", auth.ClusterID, "session", req.SessionID, "err", err)
+			}
+
+			// Step 2: Phase 1 — extract facts + per-message tags in one LLM call.
+			phase1, err := svc.ingest.ExtractPhase1(context.Background(), req.Messages)
 			if err != nil {
-				slog.Error("async memories ingest failed", "agent", req.AgentID, "session", req.SessionID, "err", err)
+				slog.Error("phase1 extraction failed", "session", req.SessionID, "err", err)
 				return
 			}
-			slog.Info("async memories ingest complete", "agent", req.AgentID, "session", req.SessionID, "status", result.Status, "memories_changed", result.MemoriesChanged)
+
+			// Step 3: fan out — patch session tags and reconcile memories in parallel.
+			go func() {
+				for i, msg := range req.Messages {
+					tags := tagsAtIndex(phase1.MessageTags, i)
+					if len(tags) == 0 {
+						continue
+					}
+					hash := service.SessionContentHash(req.SessionID, msg.Role, msg.Content)
+					if err := svc.session.PatchTags(context.Background(), req.SessionID, hash, tags); err != nil {
+						slog.Warn("session tag patch failed",
+							"cluster_id", auth.ClusterID, "session", req.SessionID, "err", err)
+					}
+				}
+			}()
+
+			go func() {
+				result, err := svc.ingest.ReconcilePhase2(
+					context.Background(), agentName, req.AgentID, req.SessionID, phase1.Facts)
+				if err != nil {
+					slog.Error("async memories reconcile failed",
+						"session", req.SessionID, "err", err)
+					return
+				}
+				slog.Info("async memories reconcile complete",
+					"session", req.SessionID, "status", result.Status,
+					"memories_changed", result.MemoriesChanged)
+			}()
 		}(auth.AgentName, ingestReq)
 
 		respond(w, http.StatusAccepted, map[string]string{"status": "accepted"})
@@ -134,10 +168,32 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		Offset:     offset,
 	}
 	svc := s.resolveServices(auth)
-	memories, total, err := svc.memory.Search(r.Context(), filter)
-	if err != nil {
-		s.handleError(w, err)
-		return
+
+	onlySession := filter.MemoryType == string(domain.TypeSession)
+
+	var memories []domain.Memory
+	var total int
+	var err error
+
+	if !onlySession {
+		memories, total, err = svc.memory.Search(r.Context(), filter)
+		if err != nil {
+			s.handleError(w, err)
+			return
+		}
+	}
+
+	if filter.Query != "" && (onlySession || filter.MemoryType == "") {
+		// SessionService.Search preserves SessionID/Source filters from the caller — intentional:
+		// session-scoped filtering is meaningful for the sessions table. MemoryService.Search
+		// resets these fields to broaden memory recall; the asymmetry is by design.
+		sessionMems, sessErr := svc.session.Search(r.Context(), filter)
+		if sessErr != nil {
+			slog.Warn("session search failed", "err", sessErr)
+		} else {
+			memories = append(memories, sessionMems...)
+			total += len(sessionMems)
+		}
 	}
 
 	if memories == nil {
@@ -260,4 +316,11 @@ func (s *Server) bootstrapMemories(w http.ResponseWriter, r *http.Request) {
 		"memories": memories,
 		"total":    len(memories),
 	})
+}
+
+func tagsAtIndex(tags [][]string, i int) []string {
+	if i < len(tags) && tags[i] != nil {
+		return tags[i]
+	}
+	return []string{}
 }
