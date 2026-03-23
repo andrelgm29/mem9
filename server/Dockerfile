@@ -15,12 +15,8 @@ COPY . .
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mnemo-server ./cmd/server
 
-# Runtime stage - use debian slim for better compatibility
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Runtime stage - use golang image itself (has everything needed)
+FROM golang:1.21
 
 WORKDIR /app
 
