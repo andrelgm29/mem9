@@ -1,16 +1,28 @@
-# Build and run in one stage
+# Stage 1: Prepare source
+FROM golang:1.21 AS prep
+
+WORKDIR /app
+
+# Copy server directory to root
+COPY server/ .
+
+# Stage 2: Build
+FROM golang:1.21 AS builder
+
+WORKDIR /app
+
+COPY --from=prep /app .
+
+# Build the binary
+RUN go build -o mnemo-server ./cmd/server
+
+# Stage 3: Runtime
 FROM golang:1.21
 
 WORKDIR /app
 
-# Copy everything
-COPY . .
+COPY --from=builder /app/mnemo-server .
 
-# Build
-RUN cd server && go build -o mnemo-server ./cmd/server
-
-# Expose port
 EXPOSE 8080
 
-# Run
-CMD ["./server/mnemo-server"]
+CMD ["./mnemo-server"]
