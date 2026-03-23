@@ -1,0 +1,10 @@
+# Ignore files that shouldn't trigger rebuilds
+.git
+.gitignore
+README.md
+*.md
+.github
+node_modules
+dist
+build
+.env.example
