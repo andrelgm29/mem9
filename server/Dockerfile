@@ -1,10 +1,7 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.21 AS builder
 
 WORKDIR /build
-
-# Install build dependencies
-RUN apk add --no-cache git make
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -18,11 +15,12 @@ COPY . .
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mnemo-server ./cmd/server
 
-# Runtime stage
-FROM alpine:latest
+# Runtime stage - use debian slim for better compatibility
+FROM debian:bookworm-slim
 
-# Install ca-certificates for HTTPS
-RUN apk --no-cache add ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -31,10 +29,6 @@ COPY --from=builder /build/mnemo-server .
 
 # Expose port
 EXPOSE 8080
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
 # Run the server
 CMD ["./mnemo-server"]
