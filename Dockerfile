@@ -1,13 +1,21 @@
-# mem9 — Dockerfile simples para Render
+# mem9 — Dockerfile para Render (multi-stage)
 FROM golang:1.20-alpine AS builder
 
-WORKDIR /app
+WORKDIR /build
+COPY server/go.mod server/go.sum ./
+RUN go mod download
+
 COPY server/ .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o mnemo-server ./cmd/mnemo-server
 
-RUN go build -o app ./cmd/mnemo-server
-
+# Runtime stage
 FROM alpine:latest
-COPY --from=builder /app/app /app
+
+WORKDIR /app
+COPY --from=builder /build/mnemo-server ./app
 
 EXPOSE 8080
+
+ENV MNEMO_PORT=8080
+
 CMD ["./app"]
