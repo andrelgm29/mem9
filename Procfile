@@ -1,1 +1,1 @@
-web: cd server && go build -o app ./cmd/mnemo-server && ./app
+web: ./server/app
