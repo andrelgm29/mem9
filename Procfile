@@ -1,1 +1,1 @@
-web: ./server/app
+web: exec ./server/app
