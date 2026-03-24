@@ -12,10 +12,10 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o mnemo-server ./cmd/mnemo-server
 FROM alpine:latest
 
 WORKDIR /app
-COPY --from=builder /build/mnemo-server ./app
+COPY --from=builder /build/mnemo-server /app/mnemo-server
 
 EXPOSE 8080
 
 ENV MNEMO_PORT=8080
 
-CMD ["./app"]
+CMD ["/app/mnemo-server"]
