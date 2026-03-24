@@ -1,30 +1,27 @@
-# mem9 — Dockerfile para Render (multi-stage)
-FROM golang:1.20-alpine AS builder
+# mem9 — Dockerfile CORRIGIDO (Claude Code debug)
+# Multi-stage: Builder (golang) → Runtime (debian slim)
 
-WORKDIR /build
+# ====== BUILDER ======
+FROM golang:1.21 AS builder
 
-# Copiar apenas go.mod primeiro (para cache)
-COPY server/go.mod ./
+WORKDIR /app
+COPY . .
 
-# Download e gerar go.sum
-RUN go mod download && go mod tidy
+RUN cd server && go build -o app ./cmd/mnemo-server
 
-# Copiar resto do código
-COPY server/ .
-
-# Compilar
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o mnemo-server ./cmd/mnemo-server
-
-# Runtime stage
-FROM alpine:latest
+# ====== RUNTIME ======
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Copiar binário compilado
-COPY --from=builder /build/mnemo-server /app/mnemo-server
+# Install ca-certificates para HTTPS/TLS
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Copy binário do builder
+COPY --from=builder /app/server/app ./app
 
 EXPOSE 8080
 
 ENV MNEMO_PORT=8080
 
-CMD ["/app/mnemo-server"]
+CMD ["./app"]
